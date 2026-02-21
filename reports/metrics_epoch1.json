@@ -1,0 +1,10 @@
+{
+  "test": {
+    "degree_mmd": 1.3433722693216572,
+    "clustering_mmd": 0.45039911803883803
+  },
+  "validation": {
+    "degree_mmd": 1.332776981697878,
+    "clustering_mmd": 0.45039911803883803
+  }
+}
