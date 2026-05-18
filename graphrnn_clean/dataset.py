@@ -6,11 +6,18 @@ from .sequence_codec import bfs_seq, encode_adj
 
 
 class GraphSequenceDataset(torch.utils.data.Dataset):
-    def __init__(self, graphs: list[nx.Graph], max_num_node: int, max_prev_node: int):
+    def __init__(
+        self,
+        graphs: list[nx.Graph],
+        max_num_node: int,
+        max_prev_node: int,
+        static_length: int | None = None,
+    ):
         self.adj_all = [np.asarray(nx.to_numpy_array(graph), dtype=np.float32) for graph in graphs]
         self.len_all = [graph.number_of_nodes() for graph in graphs]
         self.max_num_node = max_num_node
         self.max_prev_node = max_prev_node
+        self.static_length = static_length
 
     def __len__(self) -> int:
         return len(self.adj_all)
@@ -35,8 +42,10 @@ class GraphSequenceDataset(torch.utils.data.Dataset):
         y_batch[0:adj_encoded.shape[0], :] = adj_encoded
         x_batch[1:adj_encoded.shape[0] + 1, :] = adj_encoded
 
+        seq_len = self.static_length if self.static_length is not None else length
+
         return {
             "x": torch.from_numpy(x_batch),
             "y": torch.from_numpy(y_batch),
-            "len": torch.tensor(length, dtype=torch.long),
+            "len": torch.tensor(seq_len, dtype=torch.long),
         }

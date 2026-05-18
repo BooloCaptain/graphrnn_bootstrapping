@@ -20,6 +20,22 @@ def binary_cross_entropy_weight(
     return F.binary_cross_entropy(y_pred, y)
 
 
+def binary_cross_entropy_with_logits_weight(
+    y_logits: torch.Tensor,
+    y: torch.Tensor,
+    has_weight: bool = False,
+    weight_length: int = 1,
+    weight_max: float = 10.0,
+) -> torch.Tensor:
+    if has_weight:
+        weight = torch.ones_like(y)
+        weight_linear = torch.arange(1, weight_length + 1, device=y.device).float() / weight_length * weight_max
+        weight_linear = weight_linear.view(1, weight_length, 1).repeat(y.size(0), 1, y.size(2))
+        weight[:, -weight_length:, :] = weight_linear
+        return F.binary_cross_entropy_with_logits(y_logits, y, weight=weight)
+    return F.binary_cross_entropy_with_logits(y_logits, y)
+
+
 def sample_sigmoid(
     y_logits: torch.Tensor,
     sample: bool,

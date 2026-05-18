@@ -1,6 +1,7 @@
 import pickle
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -11,7 +12,7 @@ from torch.optim.lr_scheduler import MultiStepLR
 
 from .config import ExperimentConfig
 from .generator import sample_graphs_rnn
-from .model_core import binary_cross_entropy_weight
+from .model_core import binary_cross_entropy_with_logits_weight
 
 
 def _save_graph_list(graphs, fname: Path):
@@ -30,26 +31,29 @@ def train_rnn_epoch(
     scheduler_rnn: MultiStepLR,
     scheduler_output: MultiStepLR,
     device: torch.device,
+    amp_dtype: torch.dtype | None,
+    scaler: torch.cuda.amp.GradScaler | None,
+    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
 ) -> float:
     rnn.train()
     output.train()
     loss_sum = 0.0
 
     for batch_idx, data in enumerate(data_loader):
-        optimizer_rnn.zero_grad()
-        optimizer_output.zero_grad()
+        optimizer_rnn.zero_grad(set_to_none=config.grad_set_to_none)
+        optimizer_output.zero_grad(set_to_none=config.grad_set_to_none)
 
         x_unsorted = data["x"].float().to(device)
         y_unsorted = data["y"].float().to(device)
         y_len_unsorted = data["len"]
-        y_len_max = int(y_len_unsorted.max().item())
+        y_len_max = int(y_len_unsorted.max().detach())
 
         x_unsorted = x_unsorted[:, 0:y_len_max, :]
         y_unsorted = y_unsorted[:, 0:y_len_max, :]
         rnn.hidden = rnn.init_hidden(batch_size=x_unsorted.size(0), device=device)
 
         y_len, sort_index = torch.sort(y_len_unsorted, 0, descending=True)
-        y_len_list = y_len.cpu().numpy().tolist()
+        y_len_list = y_len.tolist()
 
         x = torch.index_select(x_unsorted, 0, sort_index.to(device))
         y = torch.index_select(y_unsorted, 0, sort_index.to(device))
@@ -68,35 +72,57 @@ def train_rnn_epoch(
             count_temp = np.sum(output_y_len_bin[i:])
             output_y_len.extend([min(i, y.size(2))] * int(count_temp))
 
-        h = rnn(x, pack=True, input_len=y_len_list)
-        h = pack_padded_sequence(h, y_len_list, batch_first=True).data
-        idx = torch.arange(h.size(0) - 1, -1, -1, device=device)
-        h = h.index_select(0, idx)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            h = rnn(x, pack=True, input_len=y_len_list)
+            h = pack_padded_sequence(h, y_len_list, batch_first=True).data
+            idx = torch.arange(h.size(0) - 1, -1, -1, device=device)
+            h = h.index_select(0, idx)
 
-        hidden_null = torch.zeros(config.num_layers - 1, h.size(0), h.size(1), device=device)
-        output.hidden = torch.cat((h.view(1, h.size(0), h.size(1)), hidden_null), dim=0)
+            hidden_null = torch.zeros(config.num_layers - 1, h.size(0), h.size(1), device=device)
+            output.hidden = torch.cat((h.view(1, h.size(0), h.size(1)), hidden_null), dim=0)
 
-        y_pred = output(output_x, pack=True, input_len=output_y_len)
-        y_pred = torch.sigmoid(y_pred)
+            y_logits = output(output_x, pack=True, input_len=output_y_len)
 
-        y_pred = pack_padded_sequence(y_pred, output_y_len, batch_first=True)
-        y_pred = pad_packed_sequence(y_pred, batch_first=True)[0]
-        output_y = pack_padded_sequence(output_y, output_y_len, batch_first=True)
-        output_y = pad_packed_sequence(output_y, batch_first=True)[0]
+            y_logits_packed = pack_padded_sequence(y_logits, output_y_len, batch_first=True).data
+            output_y_packed = pack_padded_sequence(output_y, output_y_len, batch_first=True).data
 
-        loss = binary_cross_entropy_weight(y_pred, output_y)
-        loss.backward()
+            if loss_fn is None:
+                loss = binary_cross_entropy_with_logits_weight(y_logits_packed, output_y_packed)
+            else:
+                loss = loss_fn(y_logits_packed, output_y_packed)
 
-        optimizer_output.step()
-        optimizer_rnn.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            
+            # Unscale the gradients BEFORE clipping when using fp16
+            scaler.unscale_(optimizer_rnn)
+            scaler.unscale_(optimizer_output)
+            
+            # The Speed Limit: Cap exploding gradients at 5.0
+            torch.nn.utils.clip_grad_norm_(rnn.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(output.parameters(), max_norm=5.0)
+            
+            scaler.step(optimizer_output)
+            scaler.step(optimizer_rnn)
+            scaler.update()
+        else:
+            loss.backward()
+            
+            # The Speed Limit (for bf16 or standard FP32)
+            torch.nn.utils.clip_grad_norm_(rnn.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(output.parameters(), max_norm=5.0)
+            
+            optimizer_output.step()
+            optimizer_rnn.step()
+
         scheduler_output.step()
         scheduler_rnn.step()
 
         if epoch % config.epochs_log == 0 and batch_idx == 0:
-            print(f"Epoch {epoch}/{config.epochs} - train loss: {loss.item():.6f}")
+            print(f"Epoch {epoch}/{config.epochs} - train loss: {loss.detach():.6f}")
 
         feature_dim = y.size(1) * y.size(2)
-        loss_sum += loss.item() * feature_dim
+        loss_sum += loss.detach() * feature_dim
 
     return loss_sum / (batch_idx + 1)
 
@@ -107,6 +133,7 @@ def train(
     rnn: torch.nn.Module,
     output: torch.nn.Module,
     device: torch.device,
+    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
 ):
     config.model_save_path.mkdir(parents=True, exist_ok=True)
     config.graph_save_path.mkdir(parents=True, exist_ok=True)
@@ -125,6 +152,15 @@ def train(
     scheduler_rnn = MultiStepLR(optimizer_rnn, milestones=config.milestones, gamma=config.lr_rate)
     scheduler_output = MultiStepLR(optimizer_output, milestones=config.milestones, gamma=config.lr_rate)
 
+    amp_dtype_map = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }
+    amp_dtype = amp_dtype_map.get(config.amp_mode)
+    scaler: torch.cuda.amp.GradScaler | None = None
+    if device.type == "cuda" and amp_dtype == torch.float16:
+        scaler = torch.cuda.amp.GradScaler()
+
     for epoch in range(1, config.epochs + 1):
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -140,6 +176,9 @@ def train(
             scheduler_rnn,
             scheduler_output,
             device,
+            amp_dtype,
+            scaler,
+            loss_fn,
         )
         if device.type == "cuda":
             torch.cuda.synchronize()
